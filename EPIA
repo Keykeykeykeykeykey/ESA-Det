@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+
+# -------------------------
+# Basic Conv (依赖 YOLO 原实现)
+# -------------------------
+class Conv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+def autopad(k, p=None):
+    if p is None:
+        p = k // 2
+    return p
+
+
+# -------------------------
+# Edge Prior (Scharr)
+# -------------------------
+class ScharrConv(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        kernel_x = torch.tensor(
+            [[-3, 0, 3],
+             [-10, 0, 10],
+             [-3, 0, 3]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+
+        kernel_y = torch.tensor(
+            [[-3, -10, -3],
+             [0, 0, 0],
+             [3, 10, 3]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+
+        self.conv_x = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
+        self.conv_y = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
+
+        self.conv_x.weight.data = kernel_x.repeat(channels, 1, 1, 1)
+        self.conv_y.weight.data = kernel_y.repeat(channels, 1, 1, 1)
+
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        return self.conv_x(x) + self.conv_y(x)
+
+
+# -------------------------
+# EPIA Core Module
+# -------------------------
+class EPIA(nn.Module):
+    """
+    Edge-Prior Infused Attention Module
+    """
+    def __init__(self, channels):
+        super().__init__()
+
+        self.edge = ScharrConv(channels)
+        self.conv = Conv(channels, channels, 3)
+
+        self.fuse = Conv(2 * channels, channels, 1)
+        self.out = Conv(channels, channels, 1)
+
+    def forward(self, x):
+        edge_feat = self.edge(x)
+        conv_feat = self.conv(x)
+
+        x_cat = torch.cat([edge_feat, conv_feat], dim=1)
+        x_fused = self.fuse(x_cat)
+
+        return self.out(x + x_fused)
+
+
+# -------------------------
+# C3k Block with EPIA
+# -------------------------
+class C3k_EPIA(nn.Module):
+    def __init__(self, c, n=1):
+        super().__init__()
+        self.blocks = nn.Sequential(*[EPIA(c) for _ in range(n)])
+
+    def forward(self, x):
+        return self.blocks(x)
+
+
+# -------------------------
+# C3k2_EPIA (最终替换模块)
+# -------------------------
+class C3k2_EPIA(nn.Module):
+    """
+    Final EPIA integration block for YOLO backbone
+    """
+    def __init__(self, c1, c2, n=1, e=0.5):
+        super().__init__()
+
+        c_ = int(c2 * e)
+
+        self.cv1 = Conv(c1, c_, 1)
+        self.cv2 = Conv(c1, c_, 1)
+
+        self.m = nn.Sequential(*[EPIA(c_) for _ in range(n)])
+
+        self.cv3 = Conv(2 * c_, c2, 1)
+
+    def forward(self, x):
+        y1 = self.m(self.cv1(x))
+        y2 = self.cv2(x)
+        return self.cv3(torch.cat((y1, y2), dim=1))
