@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+
+# -----------------------------------
+# Basic Conv（与YOLO一致的轻量实现）
+# -----------------------------------
+class Conv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, self.autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def autopad(self, k, p=None):
+        if p is None:
+            p = k // 2
+        return p
+
+
+# -----------------------------------
+# 1️⃣ AFC: Adaptive Feature Calibration
+# -----------------------------------
+class AFC(nn.Module):
+    """
+    Channel-wise nonlinear calibration using dynamic tanh scaling
+    """
+    def __init__(self, dim, alpha_init=0.5):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init)
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        x = torch.tanh(self.alpha * x)
+        return x * self.weight[:, None, None] + self.bias[:, None, None]
+
+
+# -----------------------------------
+# 2️⃣ FEA: Feature Enhancement Adapter
+# -----------------------------------
+class FEA(nn.Module):
+    """
+    Lightweight feature enhancement with channel projection
+    """
+    def __init__(self, dim):
+        super().__init__()
+
+        hidden = dim // 2
+
+        self.conv1 = nn.Conv2d(dim, hidden, 1)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(hidden, dim, 1)
+
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        identity = x
+
+        x = self.conv1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+
+        return identity + x
+
+
+# -----------------------------------
+# 3️⃣ Fusion Gate（替代 DFFN）
+# -----------------------------------
+class FusionGate(nn.Module):
+    """
+    Spatially adaptive fusion using depthwise gating
+    """
+    def __init__(self, dim):
+        super().__init__()
+
+        self.gate = nn.Sequential(
+            nn.Conv2d(dim, dim, 1),
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.gate(x)
+
+
+# -----------------------------------
+# 4️⃣ SAF Block（核心模块）
+# -----------------------------------
+class SAFBlock(nn.Module):
+    """
+    Spatial Adaptive Fusion Block
+    Structure:
+    AFC → Attention → FEA → FusionGate → FEA
+    """
+    def __init__(self, dim):
+        super().__init__()
+
+        self.afc = AFC(dim)
+        self.attn = nn.Conv2d(dim, dim, 1)  # lightweight attention proxy
+
+        self.fea1 = FEA(dim)
+        self.fusion = FusionGate(dim)
+        self.fea2 = FEA(dim)
+
+    def forward(self, x):
+        identity = x
+
+        # Calibration + Attention
+        x = self.afc(x)
+        x = x + self.attn(x)
+
+        # Enhancement + Fusion
+        x = self.fea1(x)
+        x = self.fusion(x)
+        x = self.fea2(x)
+
+        return identity + x
+
+
+# -----------------------------------
+# 5️⃣ C3k2_SAF（最终集成模块）
+# -----------------------------------
+class C3k2_SAF(nn.Module):
+    """
+    SAF integration block for YOLO backbone/head
+    """
+    def __init__(self, c1, c2, n=1, e=0.5):
+        super().__init__()
+
+        c_ = int(c2 * e)
+
+        self.cv1 = Conv(c1, c_, 1)
+        self.cv2 = Conv(c1, c_, 1)
+
+        self.m = nn.Sequential(*[SAFBlock(c_) for _ in range(n)])
+
+        self.cv3 = Conv(2 * c_, c2, 1)
+
+    def forward(self, x):
+        y1 = self.m(self.cv1(x))
+        y2 = self.cv2(x)
+        return self.cv3(torch.cat((y1, y2), dim=1))
